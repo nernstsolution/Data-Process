@@ -50,6 +50,8 @@ class ElectrolyzerDataAnalyzer:
         self.y_axis_selections = []
         self.processing_thread = None
         self.plotting_thread = None
+        self.polarization_tests = []
+        self.pol_plotting_thread = None
         
         self.create_widgets()
         
@@ -178,9 +180,12 @@ class ElectrolyzerDataAnalyzer:
         # Section 4: Data Visualization
         self.create_data_visualization_section(parent)
         
-        # Section 5: Export/Report (placeholder)
-        export_frame = ttk.LabelFrame(parent, text="5. Export/Report", padding="10")
-        export_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        # Section 5: Polarization Analyzer
+        self.create_polarization_analyzer_section(parent)
+        
+        # Section 6: Export/Report (placeholder)
+        export_frame = ttk.LabelFrame(parent, text="6. Export/Report", padding="10")
+        export_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         ttk.Label(export_frame, text="Export and reporting features will be implemented in future steps").pack()
         
     def create_data_processing_section(self, parent):
@@ -259,6 +264,69 @@ class ElectrolyzerDataAnalyzer:
         self.ax.set_xlabel("Time")
         self.ax.set_ylabel("Value")
         self.canvas.draw()
+        
+    def create_polarization_analyzer_section(self, parent):
+        # Section 5: Polarization Analyzer
+        pol_frame = ttk.LabelFrame(parent, text="5. Polarization Analyzer", padding="10")
+        pol_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        pol_frame.columnconfigure(0, weight=1)
+        pol_frame.rowconfigure(2, weight=1)
+        
+        # Control frame
+        control_frame = ttk.Frame(pol_frame)
+        control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        control_frame.columnconfigure(1, weight=1)
+        
+        # Analyze button
+        analyze_btn = ttk.Button(control_frame, text="Analyze Polarization Tests", command=self.analyze_polarization_tests)
+        analyze_btn.grid(row=0, column=0, padx=(0, 10))
+        
+        # Status label
+        self.pol_status = ttk.Label(control_frame, text="No polarization analysis performed")
+        self.pol_status.grid(row=0, column=1, sticky=tk.W)
+        
+        # Polarization tests list frame
+        list_frame = ttk.Frame(pol_frame)
+        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        
+        # Tests listbox
+        ttk.Label(list_frame, text="Detected Polarization Tests:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        
+        tests_list_frame = ttk.Frame(list_frame)
+        tests_list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        tests_list_frame.columnconfigure(0, weight=1)
+        tests_list_frame.rowconfigure(0, weight=1)
+        
+        self.pol_tests_listbox = tk.Listbox(tests_list_frame, selectmode=tk.MULTIPLE, height=6)
+        self.pol_tests_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Scrollbar for tests list
+        pol_scrollbar = ttk.Scrollbar(tests_list_frame, orient=tk.VERTICAL, command=self.pol_tests_listbox.yview)
+        pol_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.pol_tests_listbox.configure(yscrollcommand=pol_scrollbar.set)
+        
+        # Plot polarization button
+        plot_pol_btn = ttk.Button(list_frame, text="Plot Selected Tests", command=self.plot_polarization_tests)
+        plot_pol_btn.grid(row=2, column=0, pady=(10, 0))
+        
+        # Polarization plot frame
+        pol_plot_frame = ttk.Frame(pol_frame)
+        pol_plot_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        pol_plot_frame.columnconfigure(0, weight=1)
+        pol_plot_frame.rowconfigure(0, weight=1)
+        
+        # Create polarization plot
+        self.pol_fig, self.pol_ax = plt.subplots(figsize=(8, 4))
+        self.pol_canvas = FigureCanvasTkAgg(self.pol_fig, pol_plot_frame)
+        self.pol_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Initial empty polarization plot
+        self.pol_ax.set_title("No polarization data to display")
+        self.pol_ax.set_xlabel("Current Density (A/cm²)")
+        self.pol_ax.set_ylabel("Voltage (V)")
+        self.pol_canvas.draw()
         
     def browse_folder(self):
         """Open directory browser and update path"""
@@ -604,6 +672,214 @@ class ElectrolyzerDataAnalyzer:
     def _on_file_list_mousewheel(self, event):
         """Handle mousewheel scrolling for file list"""
         self.file_listbox.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+    def analyze_polarization_tests(self):
+        """Analyze data to detect polarization tests"""
+        if self.combined_df is None:
+            messagebox.showwarning("Warning", "No data available. Please process files first.")
+            return
+            
+        try:
+            self.pol_status.config(text="Analyzing polarization tests...")
+            self.root.update()
+            
+            # Detect polarization tests
+            self.polarization_tests = self._detect_polarization_tests()
+            
+            # Update listbox
+            self.pol_tests_listbox.delete(0, tk.END)
+            for i, test in enumerate(self.polarization_tests):
+                start_time = test['start_time'].strftime('%Y-%m-%d %H:%M:%S')
+                test_type = test['type']
+                duration = test['duration']
+                self.pol_tests_listbox.insert(tk.END, f"{i+1}. {start_time} - {test_type} ({duration:.1f}s)")
+            
+            self.pol_status.config(text=f"Found {len(self.polarization_tests)} polarization tests")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error analyzing polarization tests: {str(e)}")
+            self.pol_status.config(text="Analysis failed")
+            
+    def _detect_polarization_tests(self):
+        """Detect polarization tests in the data"""
+        tests = []
+        
+        # Look for current and voltage columns
+        current_cols = [col for col in self.combined_df.columns if 'current' in col.lower()]
+        voltage_cols = [col for col in self.combined_df.columns if 'voltage' in col.lower()]
+        
+        if not current_cols or not voltage_cols:
+            return tests
+            
+        # Use the first current and voltage columns found
+        current_col = current_cols[0]
+        voltage_col = voltage_cols[0]
+        
+        # Get time column
+        time_col = self.timestamp_columns[0] if self.timestamp_columns else None
+        if not time_col:
+            return tests
+            
+        # Convert to numeric
+        current_data = pd.to_numeric(self.combined_df[current_col], errors='coerce')
+        voltage_data = pd.to_numeric(self.combined_df[voltage_col], errors='coerce')
+        
+        # Remove NaN values
+        valid_mask = ~(current_data.isna() | voltage_data.isna())
+        current_clean = current_data[valid_mask]
+        voltage_clean = voltage_data[valid_mask]
+        time_clean = self.combined_df[time_col][valid_mask]
+        
+        if len(current_clean) < 10:  # Need minimum data points
+            return tests
+            
+        # Detect ramp patterns in current
+        current_diff = current_clean.diff()
+        
+        # Define thresholds for ramp detection
+        ramp_threshold = current_clean.std() * 0.1  # 10% of standard deviation
+        min_ramp_length = 5  # Minimum consecutive points for a ramp
+        
+        # Find ramp-up and ramp-down sequences
+        ramp_up_mask = current_diff > ramp_threshold
+        ramp_down_mask = current_diff < -ramp_threshold
+        
+        # Group consecutive ramp points
+        ramp_up_groups = self._group_consecutive(ramp_up_mask)
+        ramp_down_groups = self._group_consecutive(ramp_down_mask)
+        
+        # Process ramp-up tests
+        for group in ramp_up_groups:
+            if len(group) >= min_ramp_length:
+                start_idx = group[0]
+                end_idx = group[-1]
+                
+                test_data = {
+                    'start_time': time_clean.iloc[start_idx],
+                    'end_time': time_clean.iloc[end_idx],
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'type': 'Ramp Up',
+                    'duration': (time_clean.iloc[end_idx] - time_clean.iloc[start_idx]).total_seconds(),
+                    'current_data': current_clean.iloc[start_idx:end_idx+1],
+                    'voltage_data': voltage_clean.iloc[start_idx:end_idx+1],
+                    'time_data': time_clean.iloc[start_idx:end_idx+1]
+                }
+                tests.append(test_data)
+        
+        # Process ramp-down tests
+        for group in ramp_down_groups:
+            if len(group) >= min_ramp_length:
+                start_idx = group[0]
+                end_idx = group[-1]
+                
+                test_data = {
+                    'start_time': time_clean.iloc[start_idx],
+                    'end_time': time_clean.iloc[end_idx],
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'type': 'Ramp Down',
+                    'duration': (time_clean.iloc[end_idx] - time_clean.iloc[start_idx]).total_seconds(),
+                    'current_data': current_clean.iloc[start_idx:end_idx+1],
+                    'voltage_data': voltage_clean.iloc[start_idx:end_idx+1],
+                    'time_data': time_clean.iloc[start_idx:end_idx+1]
+                }
+                tests.append(test_data)
+        
+        # Sort tests by start time
+        tests.sort(key=lambda x: x['start_time'])
+        
+        return tests
+        
+    def _group_consecutive(self, mask):
+        """Group consecutive True values in a boolean mask"""
+        groups = []
+        current_group = []
+        
+        for i, value in enumerate(mask):
+            if value:
+                current_group.append(i)
+            else:
+                if current_group:
+                    groups.append(current_group)
+                    current_group = []
+        
+        if current_group:
+            groups.append(current_group)
+            
+        return groups
+        
+    def plot_polarization_tests(self):
+        """Plot selected polarization tests"""
+        if not self.polarization_tests:
+            messagebox.showwarning("Warning", "No polarization tests available. Please analyze first.")
+            return
+            
+        selected_indices = self.pol_tests_listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("Warning", "Please select at least one polarization test to plot.")
+            return
+            
+        if self.pol_plotting_thread and self.pol_plotting_thread.is_alive():
+            messagebox.showinfo("Info", "Plot generation is already in progress. Please wait.")
+            return
+            
+        # Start plotting in background thread
+        self.pol_plotting_thread = threading.Thread(target=self._plot_polarization_thread, args=(selected_indices,))
+        self.pol_plotting_thread.daemon = True
+        self.pol_plotting_thread.start()
+        
+    def _plot_polarization_thread(self, selected_indices):
+        """Background thread for plotting polarization tests"""
+        try:
+            # Update UI
+            self.root.after(0, lambda: self.pol_status.config(text="Generating polarization plot..."))
+            
+            # Get selected tests
+            selected_tests = [self.polarization_tests[i] for i in selected_indices]
+            
+            # Update UI and create plot
+            self.root.after(0, lambda: self._create_polarization_plot(selected_tests))
+            
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Error generating polarization plot: {str(e)}"))
+            
+    def _create_polarization_plot(self, tests):
+        """Create the polarization plot (thread-safe)"""
+        try:
+            # Clear previous plot
+            self.pol_ax.clear()
+            
+            # Plot each test
+            colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
+            
+            for i, test in enumerate(tests):
+                color = colors[i % len(colors)]
+                
+                # Calculate current density (assuming cell area - you may need to adjust this)
+                # For now, using current directly - you can modify this based on your cell area
+                current_density = test['current_data']  # A/cm² (adjust based on your cell area)
+                
+                # Plot voltage vs current density
+                self.pol_ax.plot(current_density, test['voltage_data'], 
+                               label=f"{test['type']} - {test['start_time'].strftime('%H:%M:%S')}",
+                               color=color, linewidth=2, marker='o', markersize=3)
+            
+            # Format plot
+            self.pol_ax.set_title(f"Polarization Curves - {len(tests)} Test(s)")
+            self.pol_ax.set_xlabel("Current Density (A/cm²)")
+            self.pol_ax.set_ylabel("Voltage (V)")
+            self.pol_ax.legend()
+            self.pol_ax.grid(True, alpha=0.3)
+            
+            # Adjust layout
+            self.pol_fig.tight_layout()
+            self.pol_canvas.draw()
+            
+            self.pol_status.config(text=f"Plotted {len(tests)} polarization test(s)")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Error creating polarization plot: {str(e)}")
 
 def main():
     root = tk.Tk()
