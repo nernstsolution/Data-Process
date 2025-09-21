@@ -6,11 +6,44 @@ from pathlib import Path
 import glob
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib import font_manager
 import numpy as np
 from datetime import datetime
 import threading
 import time
 import platform
+
+
+def _configure_plot_fonts():
+    """Reduce font sizes and prefer the Arial typeface for all Matplotlib plots."""
+    base_size = 9
+    tick_size = 8
+    legend_size = 8
+
+    plt.rcParams.update({
+        'font.size': base_size,
+        'axes.titlesize': base_size,
+        'axes.labelsize': base_size,
+        'xtick.labelsize': tick_size,
+        'ytick.labelsize': tick_size,
+        'legend.fontsize': legend_size,
+        'legend.title_fontsize': legend_size,
+        'figure.titlesize': base_size,
+    })
+
+    try:
+        if any('Arial' in font.name for font in font_manager.fontManager.ttflist):
+            plt.rcParams['font.family'] = 'Arial'
+        else:
+            # Ensure Arial is first in the sans-serif fallback list so it is used when available
+            sans_fonts = list(plt.rcParams.get('font.sans-serif', []))
+            if 'Arial' not in sans_fonts:
+                plt.rcParams['font.sans-serif'] = ['Arial'] + sans_fonts
+    except Exception:
+        pass
+
+
+_configure_plot_fonts()
 
 # macOS-specific fixes will be applied after root window creation
 
@@ -18,7 +51,7 @@ class ElectrolyzerDataAnalyzer:
     def __init__(self, root):
         self.root = root
         self.root.title("Electrolyzer Data Analyzer")
-        self.root.geometry("1000x700")
+        self.root.geometry("900x700")
         
         # macOS-specific optimizations for better responsiveness
         if platform.system() == "Darwin":  # macOS
@@ -52,39 +85,51 @@ class ElectrolyzerDataAnalyzer:
         self.plotting_thread = None
         self.polarization_tests = []
         self.pol_plotting_thread = None
-        
+        self.step_threshold = 0.5  # Minimum current step (A) to treat as ramp
+        self.active_area_var = tk.DoubleVar(value=25.0)  # Electrode active area in cm²
+        self.additional_axes = []  # Secondary matplotlib axes for multi-axis plots
+        self._scroll_accumulator = 0.0  # Trackpad-friendly scroll accumulator
+        self.voltage_columns = []
+        self.selected_voltage_tags = []
+
         self.create_widgets()
         
     def create_widgets(self):
         # Create main canvas with scrollbar for the entire window
-        self.main_canvas = tk.Canvas(self.root)
+        self.main_canvas = tk.Canvas(self.root, highlightthickness=0)
         self.main_scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.main_canvas.yview)
         self.scrollable_frame = ttk.Frame(self.main_canvas)
-        
+
         # Configure scrolling
         self.scrollable_frame.bind(
             "<Configure>",
             lambda e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
         )
-        
-        self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+
+        self.scrollable_window = self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
         self.main_canvas.configure(yscrollcommand=self.main_scrollbar.set)
-        
+
+        # Ensure inner frame matches canvas width so widgets stay within 900px window
+        self.main_canvas.bind("<Configure>", self._resize_canvas)
+
         # Pack canvas and scrollbar
         self.main_canvas.pack(side="left", fill="both", expand=True)
         self.main_scrollbar.pack(side="right", fill="y")
         
-        # Bind mousewheel to canvas
-        self.main_canvas.bind("<MouseWheel>", self._on_mousewheel)
+        # Bind mousewheel globally so scrolling works anywhere over the window
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)  # Linux scroll up
+        self.root.bind_all("<Button-5>", self._on_mousewheel)  # Linux scroll down
         
         # Main frame inside scrollable area
         main_frame = ttk.Frame(self.scrollable_frame, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+
         # Configure grid weights
         self.scrollable_frame.columnconfigure(0, weight=1)
         self.scrollable_frame.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(0, weight=1, minsize=320)
+        main_frame.columnconfigure(1, weight=3)
         
         # Section 1: Raw Data Folder Navigation
         self.create_folder_navigation_section(main_frame)
@@ -103,7 +148,7 @@ class ElectrolyzerDataAnalyzer:
         
         # Directory path entry
         self.path_var = tk.StringVar(value=self.current_path)
-        self.path_entry = ttk.Entry(folder_frame, textvariable=self.path_var, width=50)
+        self.path_entry = ttk.Entry(folder_frame, textvariable=self.path_var, width=42)
         self.path_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
         
         # Browse button
@@ -117,7 +162,7 @@ class ElectrolyzerDataAnalyzer:
     def create_file_list_section(self, parent):
         # Section 2: File List Reader
         file_frame = ttk.LabelFrame(parent, text="2. File List Reader", padding="10")
-        file_frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        file_frame.grid(row=1, column=0, sticky=(tk.N, tk.W, tk.E), pady=(0, 10))
         file_frame.columnconfigure(0, weight=1)
         file_frame.rowconfigure(1, weight=1)
         
@@ -143,12 +188,15 @@ class ElectrolyzerDataAnalyzer:
         self.file_listbox.bind("<MouseWheel>", self._on_file_list_mousewheel)
         
         # Selected files info
-        self.selected_info = ttk.Label(file_frame, text="No files selected")
+        self.selected_info = ttk.Label(file_frame, text="No files selected", wraplength=820)
         self.selected_info.grid(row=2, column=0, sticky=tk.W, pady=(5, 0))
         
         # Process button
         self.process_btn = ttk.Button(file_frame, text="Process Selected Files", command=self.process_files)
-        self.process_btn.grid(row=3, column=0, pady=(10, 0))
+        self.process_btn.grid(row=3, column=0, sticky=tk.W, pady=(10, 0))
+
+        process_all_btn = ttk.Button(file_frame, text="Process All Files", command=self.process_all_files)
+        process_all_btn.grid(row=3, column=0, sticky=tk.E, pady=(10, 0))
         
         # Progress bar
         self.progress_var = tk.DoubleVar()
@@ -156,7 +204,7 @@ class ElectrolyzerDataAnalyzer:
         self.progress_bar.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
         
         # Progress label
-        self.progress_label = ttk.Label(file_frame, text="")
+        self.progress_label = ttk.Label(file_frame, text="", wraplength=820)
         self.progress_label.grid(row=5, column=0, sticky=tk.W, pady=(2, 0))
         
         # Bind selection change event with improved responsiveness
@@ -185,13 +233,13 @@ class ElectrolyzerDataAnalyzer:
         
         # Section 6: Export/Report (placeholder)
         export_frame = ttk.LabelFrame(parent, text="6. Export/Report", padding="10")
-        export_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        export_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         ttk.Label(export_frame, text="Export and reporting features will be implemented in future steps").pack()
         
     def create_data_processing_section(self, parent):
         # Section 3: Data Processing
         process_frame = ttk.LabelFrame(parent, text="3. Data Processing", padding="10")
-        process_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        process_frame.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(0, 10))
         process_frame.columnconfigure(0, weight=1)
         
         # Processing status
@@ -210,9 +258,9 @@ class ElectrolyzerDataAnalyzer:
     def create_data_visualization_section(self, parent):
         # Section 4: Data Visualization
         viz_frame = ttk.LabelFrame(parent, text="4. Data Visualization", padding="10")
-        viz_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        viz_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         viz_frame.columnconfigure(0, weight=1)
-        viz_frame.rowconfigure(2, weight=1)
+        viz_frame.rowconfigure(3, weight=1)
         
         # Control frame for axis selection
         control_frame = ttk.Frame(viz_frame)
@@ -231,10 +279,20 @@ class ElectrolyzerDataAnalyzer:
         y_frame.grid(row=0, column=2, columnspan=2, sticky=(tk.W, tk.E))
         y_frame.columnconfigure(1, weight=1)
         
-        ttk.Label(y_frame, text="Y-axis:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        self.y_axis_var = tk.StringVar()
-        self.y_axis_combo = ttk.Combobox(y_frame, textvariable=self.y_axis_var, state="readonly")
-        self.y_axis_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 10))
+        ttk.Label(y_frame, text="Y-axis Series:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+
+        primary_list_frame = ttk.Frame(y_frame)
+        primary_list_frame.grid(row=0, column=1, sticky=(tk.W, tk.E))
+        primary_list_frame.columnconfigure(0, weight=1)
+
+        self.y_axis_listbox = tk.Listbox(primary_list_frame, selectmode=tk.MULTIPLE,
+                                         exportselection=False, height=6)
+        self.y_axis_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        primary_scrollbar = ttk.Scrollbar(primary_list_frame, orient=tk.VERTICAL,
+                                          command=self.y_axis_listbox.yview)
+        primary_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.y_axis_listbox.configure(yscrollcommand=primary_scrollbar.set)
         
         # Add more Y-axis button
         add_y_btn = ttk.Button(y_frame, text="Add Y-axis", command=self.add_y_axis)
@@ -243,14 +301,14 @@ class ElectrolyzerDataAnalyzer:
         # Y-axis list frame
         self.y_axis_frame = ttk.Frame(viz_frame)
         self.y_axis_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        
+
         # Plot button
         plot_btn = ttk.Button(viz_frame, text="Generate Plot", command=self.generate_plot)
-        plot_btn.grid(row=1, column=0, sticky=tk.E, pady=(0, 10))
-        
+        plot_btn.grid(row=2, column=0, sticky=tk.E, pady=(0, 10))
+
         # Plot display area
         plot_frame = ttk.Frame(viz_frame)
-        plot_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        plot_frame.grid(row=3, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         plot_frame.columnconfigure(0, weight=1)
         plot_frame.rowconfigure(0, weight=1)
         
@@ -268,26 +326,50 @@ class ElectrolyzerDataAnalyzer:
     def create_polarization_analyzer_section(self, parent):
         # Section 5: Polarization Analyzer
         pol_frame = ttk.LabelFrame(parent, text="5. Polarization Analyzer", padding="10")
-        pol_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        pol_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
         pol_frame.columnconfigure(0, weight=1)
-        pol_frame.rowconfigure(2, weight=1)
+        pol_frame.rowconfigure(4, weight=1)
         
         # Control frame
         control_frame = ttk.Frame(pol_frame)
         control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         control_frame.columnconfigure(1, weight=1)
-        
+
         # Analyze button
         analyze_btn = ttk.Button(control_frame, text="Analyze Polarization Tests", command=self.analyze_polarization_tests)
         analyze_btn.grid(row=0, column=0, padx=(0, 10))
-        
+
         # Status label
-        self.pol_status = ttk.Label(control_frame, text="No polarization analysis performed")
+        self.pol_status = ttk.Label(control_frame, text="No polarization analysis performed", wraplength=820)
         self.pol_status.grid(row=0, column=1, sticky=tk.W)
-        
+
+        # Active area input
+        area_label = ttk.Label(control_frame, text="Active Area (cm²):")
+        area_label.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        self.active_area_entry = ttk.Entry(control_frame, textvariable=self.active_area_var, width=10)
+        self.active_area_entry.grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
+
+        # Voltage tag selection
+        voltage_frame = ttk.LabelFrame(control_frame, text="Voltage Tags", padding="5")
+        voltage_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0))
+        voltage_frame.columnconfigure(0, weight=1)
+
+        voltage_list_frame = ttk.Frame(voltage_frame)
+        voltage_list_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        voltage_list_frame.columnconfigure(0, weight=1)
+
+        self.voltage_tag_listbox = tk.Listbox(voltage_list_frame, selectmode=tk.MULTIPLE,
+                                              exportselection=False, height=5)
+        self.voltage_tag_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        voltage_scrollbar = ttk.Scrollbar(voltage_list_frame, orient=tk.VERTICAL,
+                                          command=self.voltage_tag_listbox.yview)
+        voltage_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.voltage_tag_listbox.configure(yscrollcommand=voltage_scrollbar.set)
+
         # Polarization tests list frame
         list_frame = ttk.Frame(pol_frame)
-        list_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        list_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         
@@ -313,7 +395,7 @@ class ElectrolyzerDataAnalyzer:
         
         # Polarization plot frame
         pol_plot_frame = ttk.Frame(pol_frame)
-        pol_plot_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        pol_plot_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         pol_plot_frame.columnconfigure(0, weight=1)
         pol_plot_frame.rowconfigure(0, weight=1)
         
@@ -398,7 +480,22 @@ class ElectrolyzerDataAnalyzer:
         self.processing_thread = threading.Thread(target=self._process_files_thread)
         self.processing_thread.daemon = True
         self.processing_thread.start()
-        
+
+    def process_all_files(self):
+        """Select every file in the list and process them"""
+        file_count = self.file_listbox.size()
+        if file_count == 0:
+            messagebox.showwarning("Warning", "No files available to process. Please read files first.")
+            return
+
+        # Select all entries in the listbox
+        self.file_listbox.selection_set(0, tk.END)
+        self.selected_files = [self.file_listbox.get(i) for i in range(file_count)]
+        self.selected_info.config(text=f"Selected {file_count} file(s): {', '.join(self.selected_files)}")
+
+        # Proceed with normal processing flow
+        self.process_files()
+
     def _process_files_thread(self):
         """Background thread for processing files"""
         try:
@@ -487,44 +584,93 @@ class ElectrolyzerDataAnalyzer:
         # Find data columns (exclude timestamp and source file columns)
         self.data_columns = [col for col in self.combined_df.columns 
                            if col not in self.timestamp_columns and col != 'source_file']
-        
+        self.voltage_columns = [col for col in self.data_columns if 'volt' in col.lower()]
+
         # Update combo boxes
         self.x_axis_combo['values'] = self.timestamp_columns
         if self.timestamp_columns:
             self.x_axis_var.set(self.timestamp_columns[0])
-            
-        self.y_axis_combo['values'] = self.data_columns
-        if self.data_columns:
-            self.y_axis_var.set(self.data_columns[0])
-            
+
+        # Update primary Y-axis listbox selections
+        primary_selected = self._get_selected_listbox_items(self.y_axis_listbox)
+        self._populate_listbox(self.y_axis_listbox, self.data_columns, primary_selected)
+        if not primary_selected and self.data_columns:
+            self.y_axis_listbox.selection_set(0)
+
+        # Update additional Y-axis listboxes
+        for y_info in self.y_axis_selections:
+            selected = self._get_selected_listbox_items(y_info['listbox'])
+            self._populate_listbox(y_info['listbox'], self.data_columns, selected)
+
+        if hasattr(self, 'voltage_tag_listbox'):
+            voltage_selected = self._get_selected_listbox_items(self.voltage_tag_listbox)
+            self._populate_listbox(self.voltage_tag_listbox, self.voltage_columns, voltage_selected)
+            if not voltage_selected and self.voltage_columns:
+                self.voltage_tag_listbox.selection_set(0)
+
+    def _populate_listbox(self, listbox, options, selected_values=None):
+        """Populate a listbox with options, preserving selections when possible"""
+        if selected_values is None:
+            selected_values = []
+
+        listbox.delete(0, tk.END)
+        for option in options:
+            listbox.insert(tk.END, option)
+
+        for idx, option in enumerate(options):
+            if option in selected_values:
+                listbox.selection_set(idx)
+
+    def _get_selected_listbox_items(self, listbox):
+        """Return selected items from a listbox"""
+        selection = listbox.curselection()
+        return [listbox.get(i) for i in selection]
+
+    def _refresh_y_axis_labels(self):
+        """Refresh label text for dynamically added Y-axis frames"""
+        for idx, y_info in enumerate(self.y_axis_selections, start=2):
+            frame = y_info.get('frame')
+            try:
+                frame.configure(text=f"Y-axis {idx}")
+            except Exception:
+                pass
+
     def add_y_axis(self):
         """Add another Y-axis selection"""
         if not self.data_columns:
             messagebox.showwarning("Warning", "No data columns available. Please process files first.")
             return
             
-        # Create new Y-axis selection frame
-        y_axis_frame = ttk.Frame(self.y_axis_frame)
-        y_axis_frame.pack(fill=tk.X, pady=2)
-        
-        # Y-axis combo box
-        y_var = tk.StringVar()
-        y_combo = ttk.Combobox(y_axis_frame, textvariable=y_var, values=self.data_columns, state="readonly")
-        y_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        
-        # Remove button
-        remove_btn = ttk.Button(y_axis_frame, text="Remove", 
-                              command=lambda: self.remove_y_axis(y_axis_frame))
-        remove_btn.pack(side=tk.RIGHT)
-        
-        # Store reference
+        axis_number = len(self.y_axis_selections) + 2
+
+        # Create new Y-axis selection frame with its own label
+        y_axis_frame = ttk.LabelFrame(self.y_axis_frame, text=f"Y-axis {axis_number}", padding="5")
+        y_axis_frame.pack(fill=tk.X, pady=4)
+        y_axis_frame.columnconfigure(0, weight=1)
+
+        list_container = ttk.Frame(y_axis_frame)
+        list_container.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        list_container.columnconfigure(0, weight=1)
+
+        listbox = tk.Listbox(list_container, selectmode=tk.MULTIPLE, exportselection=False, height=6)
+        listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        scrollbar = ttk.Scrollbar(list_container, orient=tk.VERTICAL, command=listbox.yview)
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        remove_btn = ttk.Button(y_axis_frame, text="Remove",
+                                command=lambda: self.remove_y_axis(y_axis_frame))
+        remove_btn.grid(row=1, column=0, sticky=tk.E, pady=(6, 0))
+
         y_axis_info = {
             'frame': y_axis_frame,
-            'var': y_var,
-            'combo': y_combo
+            'listbox': listbox,
         }
         self.y_axis_selections.append(y_axis_info)
-        
+
+        self._populate_listbox(listbox, self.data_columns)
+
     def remove_y_axis(self, frame):
         """Remove a Y-axis selection"""
         # Find and remove from list
@@ -533,6 +679,7 @@ class ElectrolyzerDataAnalyzer:
                 self.y_axis_selections.pop(i)
                 break
         frame.destroy()
+        self._refresh_y_axis_labels()
         
     def generate_plot(self):
         """Generate plot with selected axes (optimized for large datasets)"""
@@ -545,29 +692,37 @@ class ElectrolyzerDataAnalyzer:
             messagebox.showwarning("Warning", "Please select an X-axis (time) column.")
             return
             
-        # Get Y-axis selections
-        y_cols = []
-        if self.y_axis_var.get():
-            y_cols.append(self.y_axis_var.get())
-        
-        for y_info in self.y_axis_selections:
-            if y_info['var'].get():
-                y_cols.append(y_info['var'].get())
-                
-        if not y_cols:
+        # Get Y-axis selections for each axis
+        primary_cols = self._get_selected_listbox_items(self.y_axis_listbox)
+        if not primary_cols:
             messagebox.showwarning("Warning", "Please select at least one Y-axis column.")
             return
-            
+
+        axis_requests = [
+            {
+                'columns': primary_cols,
+                'axis_label': 'Value'
+            }
+        ]
+
+        for idx, y_info in enumerate(self.y_axis_selections, start=2):
+            axis_cols = self._get_selected_listbox_items(y_info['listbox'])
+            if axis_cols:
+                axis_requests.append({
+                    'columns': axis_cols,
+                    'axis_label': f'Axis {idx}'
+                })
+
         if self.plotting_thread and self.plotting_thread.is_alive():
             messagebox.showinfo("Info", "Plot generation is already in progress. Please wait.")
             return
             
         # Start plotting in background thread
-        self.plotting_thread = threading.Thread(target=self._generate_plot_thread, args=(x_col, y_cols))
+        self.plotting_thread = threading.Thread(target=self._generate_plot_thread, args=(x_col, axis_requests))
         self.plotting_thread.daemon = True
         self.plotting_thread.start()
-        
-    def _generate_plot_thread(self, x_col, y_cols):
+
+    def _generate_plot_thread(self, x_col, axis_requests):
         """Background thread for generating plots"""
         try:
             # Update UI
@@ -591,47 +746,112 @@ class ElectrolyzerDataAnalyzer:
                 if x_data.dt.tz is not None:
                     x_data = x_data.dt.tz_convert(None)
                 
-                # Prepare plot data
-                plot_data = []
-                for y_col in y_cols:
-                    if y_col in plot_df.columns:
-                        y_data = pd.to_numeric(plot_df[y_col], errors='coerce')
-                        plot_data.append((x_data, y_data, y_col))
-                
+                axis_series = []
+
+                for axis_idx, axis_info in enumerate(axis_requests):
+                    series_list = []
+                    for y_col in axis_info['columns']:
+                        if y_col in plot_df.columns:
+                            y_data = pd.to_numeric(plot_df[y_col], errors='coerce')
+                            series_list.append({
+                                'x': x_data,
+                                'y': y_data,
+                                'label': y_col
+                            })
+
+                    if series_list:
+                        axis_series.append({
+                            'series': series_list,
+                            'axis_label': axis_info.get('axis_label', f'Axis {axis_idx + 1}')
+                        })
+
+                if not axis_series:
+                    self.root.after(0, lambda: messagebox.showwarning("Warning", "No valid Y-axis columns found in the data."))
+                    return
+
                 # Update UI and create plot
-                self.root.after(0, lambda: self._create_plot(plot_data, x_col, len(self.combined_df) > max_points))
+                self.root.after(0, lambda: self._create_plot(axis_series, x_col, len(self.combined_df) > max_points))
                 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Error", f"Error generating plot: {str(e)}"))
-            
-    def _create_plot(self, plot_data, x_col, is_sampled):
-        """Create the actual plot (thread-safe)"""
+
+    def _create_plot(self, axis_series, x_col, is_sampled):
+        """Create the actual plot with support for multiple Y-axes"""
         try:
             # Clear previous plot
             self.ax.clear()
-            
-            # Plot each Y-axis
-            for x_data, y_data, y_col in plot_data:
-                self.ax.plot(x_data, y_data, label=y_col, linewidth=1, alpha=0.8)
-            
+
+            # Remove previously created secondary axes
+            for extra_ax in self.additional_axes:
+                try:
+                    self.fig.delaxes(extra_ax)
+                except Exception:
+                    extra_ax.remove()
+            self.additional_axes = []
+
+            axes_objects = [self.ax]
+
+            # Prepare additional axes as needed
+            for axis_idx in range(1, len(axis_series)):
+                new_ax = self.ax.twinx()
+                offset = 0.08 * axis_idx
+                new_ax.spines["right"].set_position(("axes", 1 + offset))
+                new_ax.spines["right"].set_visible(True)
+                new_ax.grid(False)
+                self.additional_axes.append(new_ax)
+                axes_objects.append(new_ax)
+
+            # Plot series on each axis
+            all_labels = []
+            for axis_idx, axis_info in enumerate(axis_series):
+                axis = axes_objects[axis_idx]
+                axis_label = axis_info.get('axis_label', f'Axis {axis_idx + 1}')
+
+                for series in axis_info['series']:
+                    axis.plot(series['x'], series['y'], label=series['label'], linewidth=1, alpha=0.8)
+                    all_labels.append(series['label'])
+
+                axis.set_ylabel(axis_label)
+                if axis_idx == 0:
+                    axis.grid(True, alpha=0.3)
+                else:
+                    axis.grid(False)
+
             # Format plot
-            title = f"Electrolyzer Data: {', '.join([data[2] for data in plot_data])} vs {x_col}"
-            if is_sampled:
-                title += f" (Sampled: {len(plot_data[0][0]):,} points)"
-            
+            if all_labels:
+                title = f"Electrolyzer Data: {', '.join(all_labels)} vs {x_col}"
+            else:
+                title = f"Electrolyzer Data vs {x_col}"
+
+            if is_sampled and axis_series and axis_series[0]['series']:
+                title += f" (Sampled: {len(axis_series[0]['series'][0]['x']):,} points)"
+
             self.ax.set_title(title)
             self.ax.set_xlabel(x_col)
-            self.ax.set_ylabel("Value")
-            self.ax.legend()
-            self.ax.grid(True, alpha=0.3)
-            
+
+            # Consolidated legend across all axes
+            for legend in list(self.fig.legends):
+                legend.remove()
+
+            handles, labels = [], []
+            for axis in axes_objects:
+                h, l = axis.get_legend_handles_labels()
+                handles.extend(h)
+                labels.extend(l)
+
+            if handles:
+                self.fig.legend(handles, labels, loc='upper right', bbox_to_anchor=(1.02, 1.0))
+
             # Rotate x-axis labels for better readability
             plt.setp(self.ax.xaxis.get_majorticklabels(), rotation=45)
-            
-            # Adjust layout
-            self.fig.tight_layout()
+
+            # Adjust layout to accommodate multiple Y-axes
+            right_margin = 0.9 - 0.08 * (len(axes_objects) - 1)
+            right_margin = max(0.6, right_margin)
+            self.fig.subplots_adjust(right=right_margin, top=0.9)
+
             self.canvas.draw()
-            
+
             self.progress_label.config(text="Plot generated successfully!")
             
         except Exception as e:
@@ -667,12 +887,40 @@ class ElectrolyzerDataAnalyzer:
             
     def _on_mousewheel(self, event):
         """Handle mousewheel scrolling for main window"""
-        self.main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        
+        event_num = getattr(event, 'num', None)
+
+        if event_num == 4:  # Linux scroll up
+            self.main_canvas.yview_scroll(-1, "units")
+            return
+        if event_num == 5:  # Linux scroll down
+            self.main_canvas.yview_scroll(1, "units")
+            return
+
+        delta = getattr(event, 'delta', 0)
+        if delta == 0:
+            return
+
+        if platform.system() == "Darwin":
+            self._scroll_accumulator += delta / 10.0
+            steps = int(self._scroll_accumulator)
+            if steps != 0:
+                self.main_canvas.yview_scroll(-steps, "units")
+                self._scroll_accumulator -= steps
+        else:
+            scroll_units = -1 * int(delta / 120)
+            if scroll_units == 0:
+                scroll_units = -1 if delta < 0 else 1
+            self.main_canvas.yview_scroll(scroll_units, "units")
+
     def _on_file_list_mousewheel(self, event):
         """Handle mousewheel scrolling for file list"""
         self.file_listbox.yview_scroll(int(-1*(event.delta/120)), "units")
-        
+
+    def _resize_canvas(self, event):
+        """Keep scrollable frame width in sync with the canvas"""
+        if hasattr(self, 'scrollable_window'):
+            self.main_canvas.itemconfigure(self.scrollable_window, width=event.width)
+
     def analyze_polarization_tests(self):
         """Analyze data to detect polarization tests"""
         if self.combined_df is None:
@@ -680,11 +928,16 @@ class ElectrolyzerDataAnalyzer:
             return
             
         try:
+            voltage_tags = self.voltage_columns
+            if not voltage_tags:
+                messagebox.showwarning("Warning", "No voltage-related columns found to analyze.")
+                return
+
             self.pol_status.config(text="Analyzing polarization tests...")
             self.root.update()
             
             # Detect polarization tests
-            self.polarization_tests = self._detect_polarization_tests()
+            self.polarization_tests = self._detect_polarization_tests(voltage_tags)
             
             # Update listbox
             self.pol_tests_listbox.delete(0, tk.END)
@@ -700,114 +953,111 @@ class ElectrolyzerDataAnalyzer:
             messagebox.showerror("Error", f"Error analyzing polarization tests: {str(e)}")
             self.pol_status.config(text="Analysis failed")
             
-    def _detect_polarization_tests(self):
-        """Detect polarization tests in the data"""
+    def _detect_polarization_tests(self, voltage_tags):
+        """Detect polarization tests in the data based on current step ramps"""
         tests = []
-        
-        # Look for current and voltage columns
+
         current_cols = [col for col in self.combined_df.columns if 'current' in col.lower()]
-        voltage_cols = [col for col in self.combined_df.columns if 'voltage' in col.lower()]
-        
-        if not current_cols or not voltage_cols:
+        if not current_cols or not voltage_tags:
             return tests
-            
-        # Use the first current and voltage columns found
+
         current_col = current_cols[0]
-        voltage_col = voltage_cols[0]
-        
-        # Get time column
+        voltage_tags = [tag for tag in voltage_tags if tag in self.combined_df.columns]
+        if not voltage_tags:
+            return tests
+
         time_col = self.timestamp_columns[0] if self.timestamp_columns else None
         if not time_col:
             return tests
-            
-        # Convert to numeric
+
         current_data = pd.to_numeric(self.combined_df[current_col], errors='coerce')
-        voltage_data = pd.to_numeric(self.combined_df[voltage_col], errors='coerce')
-        
-        # Remove NaN values
-        valid_mask = ~(current_data.isna() | voltage_data.isna())
-        current_clean = current_data[valid_mask]
-        voltage_clean = voltage_data[valid_mask]
-        time_clean = self.combined_df[time_col][valid_mask]
-        
-        if len(current_clean) < 10:  # Need minimum data points
+        voltage_series = {tag: pd.to_numeric(self.combined_df[tag], errors='coerce') for tag in voltage_tags}
+        time_data = pd.to_datetime(self.combined_df[time_col], errors='coerce')
+
+        valid_mask = ~(current_data.isna() | time_data.isna())
+        for series in voltage_series.values():
+            valid_mask &= ~series.isna()
+
+        current_clean = current_data[valid_mask].reset_index(drop=True)
+        time_clean = time_data[valid_mask].reset_index(drop=True)
+        voltage_clean = {tag: series[valid_mask].reset_index(drop=True) for tag, series in voltage_series.items()}
+
+        if len(current_clean) < 2:
             return tests
-            
-        # Detect ramp patterns in current
-        current_diff = current_clean.diff()
-        
-        # Define thresholds for ramp detection
-        ramp_threshold = current_clean.std() * 0.1  # 10% of standard deviation
-        min_ramp_length = 5  # Minimum consecutive points for a ramp
-        
-        # Find ramp-up and ramp-down sequences
-        ramp_up_mask = current_diff > ramp_threshold
-        ramp_down_mask = current_diff < -ramp_threshold
-        
-        # Group consecutive ramp points
-        ramp_up_groups = self._group_consecutive(ramp_up_mask)
-        ramp_down_groups = self._group_consecutive(ramp_down_mask)
-        
-        # Process ramp-up tests
-        for group in ramp_up_groups:
-            if len(group) >= min_ramp_length:
-                start_idx = group[0]
-                end_idx = group[-1]
-                
-                test_data = {
-                    'start_time': time_clean.iloc[start_idx],
-                    'end_time': time_clean.iloc[end_idx],
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'type': 'Ramp Up',
-                    'duration': (time_clean.iloc[end_idx] - time_clean.iloc[start_idx]).total_seconds(),
-                    'current_data': current_clean.iloc[start_idx:end_idx+1],
-                    'voltage_data': voltage_clean.iloc[start_idx:end_idx+1],
-                    'time_data': time_clean.iloc[start_idx:end_idx+1]
-                }
-                tests.append(test_data)
-        
-        # Process ramp-down tests
-        for group in ramp_down_groups:
-            if len(group) >= min_ramp_length:
-                start_idx = group[0]
-                end_idx = group[-1]
-                
-                test_data = {
-                    'start_time': time_clean.iloc[start_idx],
-                    'end_time': time_clean.iloc[end_idx],
-                    'start_idx': start_idx,
-                    'end_idx': end_idx,
-                    'type': 'Ramp Down',
-                    'duration': (time_clean.iloc[end_idx] - time_clean.iloc[start_idx]).total_seconds(),
-                    'current_data': current_clean.iloc[start_idx:end_idx+1],
-                    'voltage_data': voltage_clean.iloc[start_idx:end_idx+1],
-                    'time_data': time_clean.iloc[start_idx:end_idx+1]
-                }
-                tests.append(test_data)
-        
-        # Sort tests by start time
+
+        threshold = getattr(self, 'step_threshold', 0.5)
+        sequence_dir = 0
+        sequence_start = None
+        last_idx = None
+        step_events = 0
+
+        def finalize_sequence(start_idx, end_idx, direction, steps):
+            if start_idx is None or end_idx is None or end_idx <= start_idx or steps == 0:
+                return
+
+            start_time = time_clean.iloc[start_idx]
+            end_time = time_clean.iloc[end_idx]
+            duration = (end_time - start_time).total_seconds() if pd.notna(start_time) and pd.notna(end_time) else 0.0
+
+            tests.append({
+                'start_time': start_time,
+                'end_time': end_time,
+                'start_idx': start_idx,
+                'end_idx': end_idx,
+                'type': 'Ramp Up' if direction > 0 else 'Ramp Down',
+                'duration': duration,
+                'step_count': steps,
+                'current_data': current_clean.iloc[start_idx:end_idx + 1],
+                'voltage_series': {tag: series.iloc[start_idx:end_idx + 1] for tag, series in voltage_clean.items()},
+                'time_data': time_clean.iloc[start_idx:end_idx + 1]
+            })
+
+        for idx in range(1, len(current_clean)):
+            delta = current_clean.iloc[idx] - current_clean.iloc[idx - 1]
+
+            if pd.isna(delta):
+                continue
+
+            step_dir = 0
+            if delta >= threshold:
+                step_dir = 1
+            elif delta <= -threshold:
+                step_dir = -1
+
+            if sequence_dir == 0:
+                if step_dir != 0:
+                    sequence_dir = step_dir
+                    sequence_start = idx - 1
+                    last_idx = idx
+                    step_events = 1
+                continue
+
+            if step_dir == 0:
+                last_idx = idx
+                continue
+
+            if step_dir == sequence_dir:
+                step_events += 1
+                last_idx = idx
+                continue
+
+            if last_idx is None:
+                last_idx = idx - 1
+            finalize_sequence(sequence_start, last_idx, sequence_dir, step_events)
+
+            sequence_dir = step_dir
+            sequence_start = idx - 1
+            last_idx = idx
+            step_events = 1
+
+        if sequence_dir != 0:
+            if last_idx is None:
+                last_idx = len(current_clean) - 1
+            finalize_sequence(sequence_start, last_idx, sequence_dir, step_events)
+
         tests.sort(key=lambda x: x['start_time'])
-        
+
         return tests
-        
-    def _group_consecutive(self, mask):
-        """Group consecutive True values in a boolean mask"""
-        groups = []
-        current_group = []
-        
-        for i, value in enumerate(mask):
-            if value:
-                current_group.append(i)
-            else:
-                if current_group:
-                    groups.append(current_group)
-                    current_group = []
-        
-        if current_group:
-            groups.append(current_group)
-            
-        return groups
         
     def plot_polarization_tests(self):
         """Plot selected polarization tests"""
@@ -823,13 +1073,35 @@ class ElectrolyzerDataAnalyzer:
         if self.pol_plotting_thread and self.pol_plotting_thread.is_alive():
             messagebox.showinfo("Info", "Plot generation is already in progress. Please wait.")
             return
-            
+
+        try:
+            active_area = float(self.active_area_var.get())
+        except (tk.TclError, ValueError):
+            active_area = 25.0
+
+        if active_area <= 0:
+            active_area = 25.0
+
+        selected_tags = []
+        if hasattr(self, 'voltage_tag_listbox'):
+            selected_tags = [tag for tag in self._get_selected_listbox_items(self.voltage_tag_listbox)
+                             if tag in self.voltage_columns]
+
+        if not selected_tags:
+            messagebox.showwarning("Warning", "Please select at least one voltage tag to plot.")
+            return
+
+        self.selected_voltage_tags = selected_tags
+
         # Start plotting in background thread
-        self.pol_plotting_thread = threading.Thread(target=self._plot_polarization_thread, args=(selected_indices,))
+        self.pol_plotting_thread = threading.Thread(
+            target=self._plot_polarization_thread,
+            args=(selected_indices, selected_tags, active_area)
+        )
         self.pol_plotting_thread.daemon = True
         self.pol_plotting_thread.start()
         
-    def _plot_polarization_thread(self, selected_indices):
+    def _plot_polarization_thread(self, selected_indices, voltage_tags, active_area):
         """Background thread for plotting polarization tests"""
         try:
             # Update UI
@@ -839,45 +1111,93 @@ class ElectrolyzerDataAnalyzer:
             selected_tests = [self.polarization_tests[i] for i in selected_indices]
             
             # Update UI and create plot
-            self.root.after(0, lambda: self._create_polarization_plot(selected_tests))
+            self.root.after(0, lambda: self._create_polarization_plot(selected_tests, voltage_tags, active_area))
             
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Error", f"Error generating polarization plot: {str(e)}"))
             
-    def _create_polarization_plot(self, tests):
+    def _create_polarization_plot(self, tests, voltage_tags, active_area):
         """Create the polarization plot (thread-safe)"""
         try:
             # Clear previous plot
             self.pol_ax.clear()
-            
-            # Plot each test
+
             colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray']
-            
+            markers = ['o', '^', 's', 'D', 'P', 'X', '*', 'v', 'h', '<', '>']
+
+            if not voltage_tags and tests:
+                tag_union = set()
+                for test in tests:
+                    tag_union.update(test.get('voltage_series', {}).keys())
+                voltage_tags = sorted(tag_union)
+
+            plotted_series = 0
+
             for i, test in enumerate(tests):
                 color = colors[i % len(colors)]
-                
-                # Calculate current density (assuming cell area - you may need to adjust this)
-                # For now, using current directly - you can modify this based on your cell area
-                current_density = test['current_data']  # A/cm² (adjust based on your cell area)
-                
-                # Plot voltage vs current density
-                self.pol_ax.plot(current_density, test['voltage_data'], 
-                               label=f"{test['type']} - {test['start_time'].strftime('%H:%M:%S')}",
-                               color=color, linewidth=2, marker='o', markersize=3)
-            
-            # Format plot
-            self.pol_ax.set_title(f"Polarization Curves - {len(tests)} Test(s)")
+                current_series = pd.to_numeric(test['current_data'], errors='coerce')
+
+                if current_series.dropna().empty:
+                    continue
+
+                for tag_index, tag in enumerate(voltage_tags):
+                    if tag not in test['voltage_series']:
+                        continue
+
+                    voltage_series = pd.to_numeric(test['voltage_series'][tag], errors='coerce')
+                    step_df = pd.DataFrame({
+                        'current': current_series,
+                        'voltage': voltage_series,
+                    }).dropna()
+
+                    if step_df.empty:
+                        continue
+
+                    step_df['current_bin'] = step_df['current'].round(6)
+                    averaged_steps = (step_df
+                                      .groupby('current_bin', as_index=False)
+                                      .agg({'current': 'mean', 'voltage': 'mean'})
+                                      .sort_values('current'))
+
+                    if averaged_steps.empty:
+                        continue
+
+                    current_density = averaged_steps['current'] / active_area
+                    voltage_avg = averaged_steps['voltage']
+
+                    marker = markers[tag_index % len(markers)]
+
+                    self.pol_ax.plot(
+                        current_density,
+                        voltage_avg,
+                        label=f"{test['type']} {tag} ({test['start_time'].strftime('%H:%M:%S')})",
+                        color=color,
+                        linewidth=2,
+                        marker=marker,
+                        markersize=4
+                    )
+
+                    plotted_series += 1
+
+            if plotted_series == 0:
+                self.pol_ax.set_title("No polarization data to display")
+                self.pol_ax.set_xlabel("Current Density (A/cm²)")
+                self.pol_ax.set_ylabel("Voltage (V)")
+                self.pol_canvas.draw()
+                self.pol_status.config(text="No polarization data to plot")
+                return
+
+            self.pol_ax.set_title(f"Polarization Curves - {plotted_series} Series")
             self.pol_ax.set_xlabel("Current Density (A/cm²)")
             self.pol_ax.set_ylabel("Voltage (V)")
             self.pol_ax.legend()
             self.pol_ax.grid(True, alpha=0.3)
-            
-            # Adjust layout
+
             self.pol_fig.tight_layout()
             self.pol_canvas.draw()
-            
-            self.pol_status.config(text=f"Plotted {len(tests)} polarization test(s)")
-            
+
+            self.pol_status.config(text=f"Plotted {plotted_series} polarization series")
+
         except Exception as e:
             messagebox.showerror("Error", f"Error creating polarization plot: {str(e)}")
 
