@@ -85,12 +85,16 @@ class ElectrolyzerDataAnalyzer:
         self.plotting_thread = None
         self.polarization_tests = []
         self.pol_plotting_thread = None
-        self.step_threshold = 0.5  # Minimum current step (A) to treat as ramp
+        self.step_threshold = 0.49  # Minimum current step (A) to treat as ramp
         self.active_area_var = tk.DoubleVar(value=25.0)  # Electrode active area in cm²
         self.additional_axes = []  # Secondary matplotlib axes for multi-axis plots
         self._scroll_accumulator = 0.0  # Trackpad-friendly scroll accumulator
         self.voltage_columns = []
         self.selected_voltage_tags = []
+        self.pol_hover_connection = None
+        self.pol_hover_annotation = None
+        self.pol_hover_data = []
+        self.pol_export_data = []
 
         self.create_widgets()
         
@@ -231,10 +235,15 @@ class ElectrolyzerDataAnalyzer:
         # Section 5: Polarization Analyzer
         self.create_polarization_analyzer_section(parent)
         
-        # Section 6: Export/Report (placeholder)
+        # Section 6: Export/Report
         export_frame = ttk.LabelFrame(parent, text="6. Export/Report", padding="10")
         export_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        ttk.Label(export_frame, text="Export and reporting features will be implemented in future steps").pack()
+        export_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(export_frame, text="Export the current polarization plot data").grid(row=0, column=0, sticky=tk.W)
+
+        export_btn = ttk.Button(export_frame, text="Export Polarization Plot Data", command=self.export_polarization_plot_data)
+        export_btn.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
         
     def create_data_processing_section(self, parent):
         # Section 3: Data Processing
@@ -250,10 +259,14 @@ class ElectrolyzerDataAnalyzer:
         info_frame = ttk.Frame(process_frame)
         info_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         info_frame.columnconfigure(1, weight=1)
-        
+
         ttk.Label(info_frame, text="Combined DataFrame:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
         self.df_info = ttk.Label(info_frame, text="No data")
         self.df_info.grid(row=0, column=1, sticky=tk.W)
+
+        # On-power time label
+        self.on_power_label = ttk.Label(process_frame, text="On Power Time: N/A")
+        self.on_power_label.grid(row=2, column=0, sticky=tk.W)
         
     def create_data_visualization_section(self, parent):
         # Section 4: Data Visualization
@@ -559,11 +572,13 @@ class ElectrolyzerDataAnalyzer:
         """Complete processing (thread-safe)"""
         self.processing_status.config(text=f"Successfully processed {file_count} file(s)")
         self.df_info.config(text=f"{len(self.combined_df):,} rows, {len(self.combined_df.columns)} columns")
-        
+
         self.progress_var.set(100)
         self.progress_label.config(text="Processing complete!")
         self.process_btn.config(state='normal', text="Process Selected Files")
-        
+
+        self._update_on_power_display()
+
         messagebox.showinfo("Success", f"Processed {file_count} file(s) with {total_rows:,} total rows")
         
     def _processing_error(self, error_msg):
@@ -634,6 +649,80 @@ class ElectrolyzerDataAnalyzer:
                 frame.configure(text=f"Y-axis {idx}")
             except Exception:
                 pass
+
+    def _average_polarization_steps(self, current_series, voltage_series):
+        """Average current/voltage readings into single point per current step"""
+        step_df = pd.DataFrame({
+            'current': pd.to_numeric(current_series, errors='coerce'),
+            'voltage': pd.to_numeric(voltage_series, errors='coerce')
+        }).dropna()
+
+        if step_df.empty:
+            return step_df
+
+        step_size = max(getattr(self, 'step_threshold', 0.5), 1e-9)
+        step_df['current_bin'] = np.round(step_df['current'] / step_size) * step_size
+
+        averaged_steps = (step_df
+                          .groupby('current_bin', as_index=False)
+                          .agg({'current': 'mean', 'voltage': 'mean'})
+                          .sort_values('current'))
+
+        return averaged_steps
+
+    def _calculate_on_power_time(self):
+        if self.combined_df is None or not self.timestamp_columns:
+            return None
+
+        time_col = self.timestamp_columns[0]
+        current_cols = [col for col in self.combined_df.columns if 'current' in col.lower()]
+        if not current_cols:
+            return None
+
+        current_col = current_cols[0]
+
+        time_series = pd.to_datetime(self.combined_df[time_col], errors='coerce')
+        tz_info = getattr(time_series.dt, 'tz', None)
+        if tz_info is not None:
+            try:
+                time_series = time_series.dt.tz_convert(None)
+            except Exception:
+                time_series = time_series.dt.tz_localize(None)
+
+        current_series = pd.to_numeric(self.combined_df[current_col], errors='coerce')
+
+        valid_mask = ~(time_series.isna() | current_series.isna())
+        if not valid_mask.any():
+            return None
+
+        df = pd.DataFrame({
+            'time': time_series[valid_mask],
+            'current': current_series[valid_mask]
+        }).sort_values('time')
+
+        if df.empty:
+            return None
+
+        df['time_diff'] = df['time'].shift(-1) - df['time']
+        df['time_diff'] = df['time_diff'].fillna(pd.Timedelta(0))
+
+        positive_mask = df['current'] > 0
+        on_power_duration = df.loc[positive_mask, 'time_diff']
+
+        total_duration = pd.to_timedelta(on_power_duration[on_power_duration >= pd.Timedelta(0)].sum())
+        return total_duration
+
+    def _update_on_power_display(self):
+        duration = self._calculate_on_power_time()
+        if duration is None or duration.total_seconds() <= 0:
+            self.on_power_label.config(text="On Power Time: N/A")
+            return
+
+        total_seconds = int(duration.total_seconds())
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        self.on_power_label.config(text=f"On Power Time: {formatted}")
 
     def add_y_axis(self):
         """Add another Y-axis selection"""
@@ -1100,7 +1189,33 @@ class ElectrolyzerDataAnalyzer:
         )
         self.pol_plotting_thread.daemon = True
         self.pol_plotting_thread.start()
-        
+
+    def export_polarization_plot_data(self):
+        """Export the data backing the latest polarization plot"""
+        if not self.pol_export_data:
+            messagebox.showwarning("Warning", "No polarization plot data available to export. Generate a plot first.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Polarization Plot Data",
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+
+        if not file_path:
+            return
+
+        try:
+            export_df = pd.DataFrame(self.pol_export_data)
+            if not export_df.empty:
+                export_df = export_df.sort_values(['start_time', 'tag', 'current_density'])
+                export_df['start_time'] = export_df['start_time'].astype(str)
+                export_df['end_time'] = export_df['end_time'].astype(str)
+            export_df.to_csv(file_path, index=False)
+            messagebox.showinfo("Success", f"Polarization plot data exported to\n{file_path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to export data: {exc}")
+
     def _plot_polarization_thread(self, selected_indices, voltage_tags, active_area):
         """Background thread for plotting polarization tests"""
         try:
@@ -1132,6 +1247,14 @@ class ElectrolyzerDataAnalyzer:
                 voltage_tags = sorted(tag_union)
 
             plotted_series = 0
+            self.pol_hover_data = []
+            self.pol_export_data = []
+            if self.pol_hover_annotation is not None:
+                try:
+                    self.pol_hover_annotation.remove()
+                except Exception:
+                    pass
+                self.pol_hover_annotation = None
 
             for i, test in enumerate(tests):
                 color = colors[i % len(colors)]
@@ -1145,29 +1268,17 @@ class ElectrolyzerDataAnalyzer:
                         continue
 
                     voltage_series = pd.to_numeric(test['voltage_series'][tag], errors='coerce')
-                    step_df = pd.DataFrame({
-                        'current': current_series,
-                        'voltage': voltage_series,
-                    }).dropna()
-
-                    if step_df.empty:
-                        continue
-
-                    step_df['current_bin'] = step_df['current'].round(6)
-                    averaged_steps = (step_df
-                                      .groupby('current_bin', as_index=False)
-                                      .agg({'current': 'mean', 'voltage': 'mean'})
-                                      .sort_values('current'))
-
+                    averaged_steps = self._average_polarization_steps(current_series, voltage_series)
                     if averaged_steps.empty:
                         continue
 
-                    current_density = averaged_steps['current'] / active_area
-                    voltage_avg = averaged_steps['voltage']
+                    current_avg = averaged_steps['current'].to_numpy()
+                    voltage_avg = averaged_steps['voltage'].to_numpy()
+                    current_density = current_avg / active_area
 
                     marker = markers[tag_index % len(markers)]
 
-                    self.pol_ax.plot(
+                    line, = self.pol_ax.plot(
                         current_density,
                         voltage_avg,
                         label=f"{test['type']} {tag} ({test['start_time'].strftime('%H:%M:%S')})",
@@ -1176,6 +1287,24 @@ class ElectrolyzerDataAnalyzer:
                         marker=marker,
                         markersize=4
                     )
+
+                    for idx_point, (x_val, y_val) in enumerate(zip(current_density, voltage_avg)):
+                        self.pol_hover_data.append({
+                            'x': float(x_val),
+                            'y': float(y_val),
+                            'tag': tag,
+                            'test_label': f"{test['type']} ({test['start_time'].strftime('%H:%M:%S')})"
+                        })
+
+                        self.pol_export_data.append({
+                            'test_type': test['type'],
+                            'start_time': test['start_time'],
+                            'end_time': test['end_time'],
+                            'tag': tag,
+                            'current_density': float(x_val),
+                            'voltage': float(y_val),
+                            'current_avg': float(current_avg[idx_point] if idx_point < len(current_avg) else x_val * active_area)
+                        })
 
                     plotted_series += 1
 
@@ -1198,8 +1327,64 @@ class ElectrolyzerDataAnalyzer:
 
             self.pol_status.config(text=f"Plotted {plotted_series} polarization series")
 
+            if self.pol_hover_annotation is None:
+                self.pol_hover_annotation = self.pol_ax.annotate(
+                    '', xy=(0, 0), xytext=(10, 12), textcoords='offset points',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='gray', alpha=0.9)
+                )
+            self.pol_hover_annotation.set_visible(False)
+
+            if self.pol_hover_connection is not None:
+                self.pol_canvas.mpl_disconnect(self.pol_hover_connection)
+                self.pol_hover_connection = None
+
+            if self.pol_hover_data:
+                self.pol_hover_connection = self.pol_canvas.mpl_connect('motion_notify_event', self._on_pol_hover)
+
         except Exception as e:
             messagebox.showerror("Error", f"Error creating polarization plot: {str(e)}")
+
+    def _on_pol_hover(self, event):
+        """Display hover tooltip for polarization plot points"""
+        if not self.pol_hover_data or self.pol_hover_annotation is None:
+            return
+
+        if event.inaxes != self.pol_ax:
+            if self.pol_hover_annotation.get_visible():
+                self.pol_hover_annotation.set_visible(False)
+                self.pol_canvas.draw_idle()
+            return
+
+        mouse_x, mouse_y = event.x, event.y
+        if mouse_x is None or mouse_y is None:
+            return
+
+        best_point = None
+        best_dist = float('inf')
+
+        for point in self.pol_hover_data:
+            x_disp, y_disp = self.pol_ax.transData.transform((point['x'], point['y']))
+            dist = np.hypot(x_disp - mouse_x, y_disp - mouse_y)
+            if dist < best_dist:
+                best_dist = dist
+                best_point = point
+
+        if best_point and best_dist < 15:
+            text = (
+                f"{best_point['test_label']}\n"
+                f"Tag: {best_point['tag']}\n"
+                f"I: {best_point['x']:.3f} A/cm²\n"
+                f"V: {best_point['y']:.3f} V"
+            )
+            self.pol_hover_annotation.xy = (best_point['x'], best_point['y'])
+            self.pol_hover_annotation.set_text(text)
+            if not self.pol_hover_annotation.get_visible():
+                self.pol_hover_annotation.set_visible(True)
+            self.pol_canvas.draw_idle()
+        else:
+            if self.pol_hover_annotation.get_visible():
+                self.pol_hover_annotation.set_visible(False)
+                self.pol_canvas.draw_idle()
 
 def main():
     root = tk.Tk()
