@@ -95,6 +95,13 @@ class ElectrolyzerDataAnalyzer:
         self.pol_hover_annotation = None
         self.pol_hover_data = []
         self.pol_export_data = []
+        self.durability_current_var = tk.DoubleVar(value=50.0)
+        self.durability_voltage_listbox = None
+        self.durability_status = None
+        self.durability_fig = None
+        self.durability_ax = None
+        self.durability_canvas = None
+        self.durability_thread = None
 
         self.create_widgets()
         
@@ -234,16 +241,12 @@ class ElectrolyzerDataAnalyzer:
         
         # Section 5: Polarization Analyzer
         self.create_polarization_analyzer_section(parent)
-        
-        # Section 6: Export/Report
-        export_frame = ttk.LabelFrame(parent, text="6. Export/Report", padding="10")
-        export_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        export_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(export_frame, text="Export the current polarization plot data").grid(row=0, column=0, sticky=tk.W)
+        # Section 6: Durability Analyzer
+        self.create_durability_analyzer_section(parent)
 
-        export_btn = ttk.Button(export_frame, text="Export Polarization Plot Data", command=self.export_polarization_plot_data)
-        export_btn.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        # Section 7: Export/Report
+        self.create_export_section(parent)
         
     def create_data_processing_section(self, parent):
         # Section 3: Data Processing
@@ -423,6 +426,279 @@ class ElectrolyzerDataAnalyzer:
         self.pol_ax.set_ylabel("Voltage (V)")
         self.pol_canvas.draw()
         
+    def create_durability_analyzer_section(self, parent):
+        # Section 6: Durability Analyzer
+        dur_frame = ttk.LabelFrame(parent, text="6. Durability Analyzer", padding="10")
+        dur_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        dur_frame.columnconfigure(0, weight=1)
+        dur_frame.rowconfigure(3, weight=1)
+
+        control_frame = ttk.Frame(dur_frame)
+        control_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 8))
+        control_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(control_frame, text="Target Current (A):").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        current_entry = ttk.Entry(control_frame, textvariable=self.durability_current_var, width=10)
+        current_entry.grid(row=0, column=1, sticky=tk.W)
+
+        ttk.Label(control_frame, text="Voltage Tags:").grid(row=0, column=2, sticky=tk.W, padx=(20, 10))
+
+        voltage_list_frame = ttk.Frame(control_frame)
+        voltage_list_frame.grid(row=0, column=3, sticky=(tk.W, tk.E))
+        voltage_list_frame.columnconfigure(0, weight=1)
+
+        self.durability_voltage_listbox = tk.Listbox(
+            voltage_list_frame,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            height=5
+        )
+        self.durability_voltage_listbox.grid(row=0, column=0, sticky=(tk.W, tk.E))
+
+        durability_voltage_scroll = ttk.Scrollbar(
+            voltage_list_frame,
+            orient=tk.VERTICAL,
+            command=self.durability_voltage_listbox.yview
+        )
+        durability_voltage_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.durability_voltage_listbox.configure(yscrollcommand=durability_voltage_scroll.set)
+
+        self.durability_status = ttk.Label(dur_frame, text="No durability analysis performed", wraplength=820)
+        self.durability_status.grid(row=1, column=0, sticky=tk.W)
+
+        analyze_btn = ttk.Button(dur_frame, text="Generate Durability Plot", command=self.plot_durability)
+        analyze_btn.grid(row=2, column=0, sticky=tk.E, pady=(6, 6))
+
+        plot_frame = ttk.Frame(dur_frame)
+        plot_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+
+        self.durability_fig, self.durability_ax = plt.subplots(figsize=(8, 4))
+        self.durability_canvas = FigureCanvasTkAgg(self.durability_fig, plot_frame)
+        self.durability_canvas.get_tk_widget().grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        self.durability_ax.set_title("No durability data to display")
+        self.durability_ax.set_xlabel("On Power Time (hours)")
+        self.durability_ax.set_ylabel("Voltage (V)")
+        self.durability_canvas.draw()
+
+    def create_export_section(self, parent):
+        # Section 7: Export/Report
+        export_frame = ttk.LabelFrame(parent, text="7. Export/Report", padding="10")
+        export_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+        export_frame.columnconfigure(0, weight=1)
+
+        ttk.Label(export_frame, text="Export the current polarization plot data").grid(row=0, column=0, sticky=tk.W)
+
+        export_btn = ttk.Button(export_frame, text="Export Polarization Plot Data", command=self.export_polarization_plot_data)
+        export_btn.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+
+    def _find_current_columns(self):
+        if self.combined_df is None:
+            return []
+
+        current_columns = []
+        for col in self.combined_df.columns:
+            lowered = col.lower()
+            if 'current' in lowered:
+                current_columns.append(col)
+        return current_columns
+
+    def plot_durability(self):
+        """Trigger durability analysis plot (non-blocking)."""
+        if self.combined_df is None:
+            messagebox.showwarning("Warning", "No data available. Please process files first.")
+            return
+
+        try:
+            target_current = float(self.durability_current_var.get())
+        except (tk.TclError, ValueError):
+            messagebox.showwarning("Warning", "Please enter a valid current value.")
+            return
+
+        if target_current <= 0:
+            messagebox.showwarning("Warning", "Current must be greater than zero.")
+            return
+
+        if self.durability_voltage_listbox is None:
+            messagebox.showwarning("Warning", "Durability voltage selections are not ready yet.")
+            return
+
+        voltage_tags = self._get_selected_listbox_items(self.durability_voltage_listbox)
+        if not voltage_tags:
+            messagebox.showwarning("Warning", "Please select at least one voltage tag.")
+            return
+
+        if self.durability_thread and self.durability_thread.is_alive():
+            messagebox.showinfo("Info", "Durability plot generation is already in progress. Please wait.")
+            return
+
+        self.durability_status.config(text="Preparing durability plot...")
+
+        self.durability_thread = threading.Thread(
+            target=self._plot_durability_thread,
+            args=(target_current, voltage_tags),
+            daemon=True
+        )
+        self.durability_thread.start()
+
+    def _plot_durability_thread(self, target_current, voltage_tags):
+        try:
+            current_cols = self._find_current_columns()
+            if not current_cols:
+                self.root.after(0, lambda: self._durability_warning(
+                    "No current column found in the combined data."
+                ))
+                return
+
+            if not self.timestamp_columns:
+                self.root.after(0, lambda: self._durability_warning(
+                    "No timestamp column available for calculating on-power time."
+                ))
+                return
+
+            time_col = self.timestamp_columns[0]
+            current_col = current_cols[0]
+
+            df = self.combined_df.copy()
+
+            time_series = pd.to_datetime(df[time_col], errors='coerce')
+            tz_info = getattr(time_series.dt, 'tz', None)
+            if tz_info is not None:
+                try:
+                    time_series = time_series.dt.tz_convert(None)
+                except Exception:
+                    time_series = time_series.dt.tz_localize(None)
+
+            current_series = pd.to_numeric(df[current_col], errors='coerce')
+
+            df = df.assign(__time=time_series, __current=current_series)
+
+            df = df.loc[~df['__time'].isna() & ~df['__current'].isna()].copy()
+            if df.empty:
+                self.root.after(0, lambda: self._durability_warning(
+                    "No valid timestamps or current readings available."
+                ))
+                return
+
+            df = df.sort_values('__time')
+
+            tolerance = max(0.05, abs(target_current) * 0.02)
+            current_mask = np.isclose(df['__current'], target_current, rtol=0.01, atol=tolerance) & (df['__current'] > 0)
+
+            filtered = df.loc[current_mask].copy()
+            if filtered.empty:
+                self.root.after(0, lambda: self._durability_warning(
+                    f"No rows found near {target_current:.2f} A within ±{tolerance:.2f}."
+                ))
+                return
+
+            filtered['on_power_seconds'] = filtered['__time'].diff().dt.total_seconds().fillna(0)
+            filtered['on_power_seconds'] = filtered['on_power_seconds'].clip(lower=0)
+            filtered['on_power_hours'] = filtered['on_power_seconds'].cumsum() / 3600.0
+
+            plot_series = []
+            point_count = 0
+
+            for tag in voltage_tags:
+                if tag not in filtered.columns:
+                    continue
+
+                voltage_series = pd.to_numeric(filtered[tag], errors='coerce')
+                valid_mask = ~voltage_series.isna()
+                if not valid_mask.any():
+                    continue
+
+                times = filtered.loc[valid_mask, 'on_power_hours'].to_numpy()
+                voltages = voltage_series[valid_mask].to_numpy()
+
+                if times.size == 0:
+                    continue
+
+                plot_series.append({
+                    'tag': tag,
+                    'time': times,
+                    'voltage': voltages
+                })
+                point_count += times.size
+
+            if not plot_series:
+                self.root.after(0, lambda: self._durability_warning(
+                    "Selected voltage tags do not contain data at the requested current level."
+                ))
+                return
+
+            result = {
+                'series': plot_series,
+                'target_current': target_current,
+                'tolerance': tolerance,
+                'row_count': len(filtered),
+                'point_count': point_count
+            }
+
+            self.root.after(0, lambda res=result: self._render_durability_plot(res))
+
+        except Exception as exc:
+            self.root.after(0, lambda: (
+                self.durability_status.config(text="Durability analysis failed."),
+                messagebox.showerror("Error", f"Error generating durability plot: {exc}")
+            ))
+
+    def _render_durability_plot(self, result):
+        series = result.get('series') if result else None
+
+        if not series:
+            self._durability_warning("No durability data to display.", show_popup=False)
+            return
+
+        self.durability_ax.clear()
+
+        for idx, item in enumerate(series):
+            label = item.get('tag', f'Tag {idx + 1}')
+            self.durability_ax.plot(item['time'], item['voltage'], label=label, linewidth=1.5)
+
+        self.durability_ax.set_xlabel("On Power Time (hours)")
+        self.durability_ax.set_ylabel("Voltage (V)")
+
+        target_current = result.get('target_current', 0)
+        point_count = result.get('point_count', 0)
+        tolerance = result.get('tolerance', 0)
+
+        title = f"Durability @ {target_current:.2f} A"
+        if point_count:
+            title += f" ({point_count:,} points)"
+        self.durability_ax.set_title(title)
+
+        if len(series) > 1:
+            self.durability_ax.legend()
+
+        self.durability_ax.grid(True, alpha=0.3)
+        self.durability_fig.tight_layout()
+        self.durability_canvas.draw()
+
+        max_time = max((item['time'][-1] if len(item['time']) else 0 for item in series), default=0)
+        status_text = (
+            f"Plotted {len(series)} voltage tag(s) across {result.get('row_count', 0)} matching rows "
+            f"(±{tolerance:.2f} A), reaching {max_time:.2f} on-power hours."
+        )
+        self.durability_status.config(text=status_text)
+
+    def _durability_warning(self, message, show_popup=True):
+        if self.durability_status is not None:
+            self.durability_status.config(text=message)
+
+        if show_popup:
+            messagebox.showwarning("Warning", message)
+
+        if self.durability_ax is not None:
+            self.durability_ax.clear()
+            self.durability_ax.set_title("No durability data to display")
+            self.durability_ax.set_xlabel("On Power Time (hours)")
+            self.durability_ax.set_ylabel("Voltage (V)")
+            if self.durability_canvas is not None:
+                self.durability_canvas.draw()
+
     def browse_folder(self):
         """Open directory browser and update path"""
         folder_path = filedialog.askdirectory(initialdir=self.current_path)
@@ -622,6 +898,12 @@ class ElectrolyzerDataAnalyzer:
             self._populate_listbox(self.voltage_tag_listbox, self.voltage_columns, voltage_selected)
             if not voltage_selected and self.voltage_columns:
                 self.voltage_tag_listbox.selection_set(0)
+
+        if self.durability_voltage_listbox is not None:
+            durability_selected = self._get_selected_listbox_items(self.durability_voltage_listbox)
+            self._populate_listbox(self.durability_voltage_listbox, self.voltage_columns, durability_selected)
+            if not durability_selected and self.voltage_columns:
+                self.durability_voltage_listbox.selection_set(0)
 
     def _populate_listbox(self, listbox, options, selected_values=None):
         """Populate a listbox with options, preserving selections when possible"""
@@ -953,7 +1235,13 @@ class ElectrolyzerDataAnalyzer:
     def _on_click(self, event):
         """Handle click events for better responsiveness"""
         if platform.system() == "Darwin":  # macOS
-            # Force immediate focus
+            widget = getattr(event, 'widget', None)
+            if widget is not None:
+                try:
+                    widget.focus_set()
+                    return
+                except tk.TclError:
+                    pass
             self.root.focus_set()
             
     def _on_release(self, event):
