@@ -3,7 +3,6 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import os
 from pathlib import Path
-import glob
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib import font_manager
@@ -12,6 +11,79 @@ from datetime import datetime
 import threading
 import time
 import platform
+import codecs
+
+
+_SUPPORTED_DELIMITERS = (',', '\t', ';')
+
+
+def _detect_file_encoding(file_path):
+    """Return a best-effort encoding guess based on BOM hints."""
+    with open(file_path, 'rb') as handle:
+        start = handle.read(4)
+    if start.startswith(codecs.BOM_UTF16_LE) or start.startswith(codecs.BOM_UTF16_BE):
+        return 'utf-16'
+    if start.startswith(codecs.BOM_UTF8):
+        return 'utf-8-sig'
+    return 'utf-8'
+
+
+def _looks_like_header(line, delimiter):
+    """Heuristic test to decide if a line contains column headers."""
+    cleaned = line.strip().lstrip('\ufeff')
+    if not cleaned or cleaned.startswith('#'):
+        return False
+
+    parts = [part.strip() for part in cleaned.split(delimiter)]
+    if len(parts) <= 1:
+        return False
+
+    letter_parts = [p for p in parts if any(ch.isalpha() for ch in p)]
+    if not letter_parts:
+        return False
+
+    for part in letter_parts:
+        lowered = part.lower()
+        if any(keyword in lowered for keyword in ('time', 'date', 'timestamp')):
+            return True
+
+    return len(letter_parts) >= max(2, len(parts) // 2)
+
+
+def _detect_file_layout(file_path, sample_limit=200):
+    """Infer encoding, delimiter, and header line index for a raw data file."""
+    encoding = _detect_file_encoding(file_path)
+    sample_lines = []
+    delimiter_scores = {delim: 0 for delim in _SUPPORTED_DELIMITERS}
+
+    with open(file_path, encoding=encoding, errors='ignore') as handle:
+        for idx in range(sample_limit):
+            line = handle.readline()
+            if not line:
+                break
+            stripped = line.rstrip('\r\n')
+            sample_lines.append((idx, stripped))
+            for delim in delimiter_scores:
+                delimiter_scores[delim] += stripped.count(delim)
+
+        delimiter = max(delimiter_scores, key=delimiter_scores.get)
+        if delimiter_scores[delimiter] == 0:
+            delimiter = ','
+
+        header_index = next((idx for idx, candidate in sample_lines if _looks_like_header(candidate, delimiter)), None)
+
+        if header_index is not None:
+            return encoding, delimiter, header_index
+
+        next_idx = sample_lines[-1][0] + 1 if sample_lines else 0
+
+        for line in handle:
+            stripped = line.rstrip('\r\n')
+            if _looks_like_header(stripped, delimiter):
+                return encoding, delimiter, next_idx
+            next_idx += 1
+
+    return encoding, delimiter, 0
 
 
 def _configure_plot_fonts():
@@ -714,22 +786,27 @@ class ElectrolyzerDataAnalyzer:
                 messagebox.showerror("Error", f"Directory does not exist: {self.current_path}")
                 return
                 
-            # Find all CSV files in the directory
-            csv_files = glob.glob(os.path.join(self.current_path, "*.csv"))
+            # Find supported data files in the directory
+            folder = Path(self.current_path)
+            if not folder.is_dir():
+                messagebox.showerror("Error", f"Directory does not exist: {self.current_path}")
+                return
+
+            patterns = ('*.csv', '*.CSV', '*.txt', '*.TXT')
+            data_files = sorted({file.name for pattern in patterns for file in folder.glob(pattern)})
             
-            if not csv_files:
-                messagebox.showwarning("Warning", "No CSV files found in the selected directory")
+            if not data_files:
+                messagebox.showwarning("Warning", "No supported data files found in the selected directory")
                 return
                 
             # Clear existing file list
             self.file_listbox.delete(0, tk.END)
             
             # Add files to listbox
-            for file_path in sorted(csv_files):
-                filename = os.path.basename(file_path)
+            for filename in data_files:
                 self.file_listbox.insert(tk.END, filename)
                 
-            messagebox.showinfo("Success", f"Found {len(csv_files)} CSV files")
+            messagebox.showinfo("Success", f"Found {len(data_files)} data file(s)")
             
         except Exception as e:
             messagebox.showerror("Error", f"Error reading files: {str(e)}")
@@ -799,11 +876,11 @@ class ElectrolyzerDataAnalyzer:
                 
                 file_path = os.path.join(self.current_path, filename)
                 
-                # Read CSV file with optimized settings
-                df = pd.read_csv(file_path, skiprows=3, low_memory=False)
+                # Read data file with format-aware settings
+                df = self._read_data_file(file_path)
                 
-                # Clean column names
-                df.columns = df.columns.str.strip()
+                if df is None or df.empty:
+                    raise ValueError(f"No data rows detected in {filename}")
                 
                 # Add source file column
                 df['source_file'] = filename
@@ -839,6 +916,52 @@ class ElectrolyzerDataAnalyzer:
         except Exception as e:
             self.root.after(0, lambda: self._processing_error(str(e)))
             
+    def _read_data_file(self, file_path):
+        """Load a raw data file while adapting to its format."""
+        encoding, delimiter, header_line = _detect_file_layout(file_path)
+
+        read_kwargs = {
+            'header': 0,
+            'skiprows': max(header_line, 0),
+            'encoding': encoding,
+            'sep': delimiter,
+        }
+
+        use_python_engine = delimiter != ',' or encoding.startswith('utf-16')
+        if use_python_engine:
+            read_kwargs['engine'] = 'python'
+        else:
+            read_kwargs['low_memory'] = False
+
+        try:
+            df = pd.read_csv(file_path, **read_kwargs)
+        except UnicodeDecodeError:
+            fallback_kwargs = read_kwargs.copy()
+            fallback_kwargs['encoding'] = 'utf-8'
+            df = pd.read_csv(file_path, **fallback_kwargs)
+        except pd.errors.ParserError:
+            fallback_kwargs = read_kwargs.copy()
+            fallback_kwargs['engine'] = 'python'
+            fallback_kwargs.pop('low_memory', None)
+            df = pd.read_csv(file_path, **fallback_kwargs)
+
+        df.columns = df.columns.astype(str).str.strip().str.lstrip('\ufeff')
+        df = df.loc[:, ~(df.columns.str.startswith('Unnamed') | (df.columns == ''))]
+
+        if 'Date' in df.columns:
+            df['Date'] = df['Date'].astype(str).str.strip()
+
+        if {'Date', 'SYS TIME SS'}.issubset(df.columns):
+            timestamp_series = pd.to_datetime(df['Date'], errors='coerce', infer_datetime_format=True)
+            if timestamp_series.notna().any():
+                df.insert(0, 'timestamp', timestamp_series)
+            else:
+                df.insert(0, 'timestamp', df['Date'])
+
+            df = df.drop(columns=['SYS TIME SS'])
+
+        return df
+
     def _update_progress(self, progress, message):
         """Update progress bar and label (thread-safe)"""
         self.progress_var.set(progress)
