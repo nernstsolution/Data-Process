@@ -159,6 +159,7 @@ class ElectrolyzerDataAnalyzer:
         self.pol_plotting_thread = None
         self.step_threshold = 0.49  # Minimum current step (A) to treat as ramp
         self.active_area_var = tk.DoubleVar(value=25.0)  # Electrode active area in cm²
+        self.pol_avg_method_var = tk.StringVar(value='second_half')  # Step averaging preference
         self.additional_axes = []  # Secondary matplotlib axes for multi-axis plots
         self._scroll_accumulator = 0.0  # Trackpad-friendly scroll accumulator
         self.voltage_columns = []
@@ -437,9 +438,28 @@ class ElectrolyzerDataAnalyzer:
         self.active_area_entry = ttk.Entry(control_frame, textvariable=self.active_area_var, width=10)
         self.active_area_entry.grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
 
+        # Step averaging method selection
+        avg_frame = ttk.LabelFrame(control_frame, text="Step Averaging Method", padding="5")
+        avg_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0))
+        avg_frame.columnconfigure(0, weight=1)
+
+        ttk.Radiobutton(
+            avg_frame,
+            text="Average second half of each step",
+            value='second_half',
+            variable=self.pol_avg_method_var
+        ).grid(row=0, column=0, sticky=tk.W)
+
+        ttk.Radiobutton(
+            avg_frame,
+            text="Average entire step",
+            value='full_step',
+            variable=self.pol_avg_method_var
+        ).grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+
         # Voltage tag selection
         voltage_frame = ttk.LabelFrame(control_frame, text="Voltage Tags", padding="5")
-        voltage_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0))
+        voltage_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0))
         voltage_frame.columnconfigure(0, weight=1)
 
         voltage_list_frame = ttk.Frame(voltage_frame)
@@ -1067,13 +1087,33 @@ class ElectrolyzerDataAnalyzer:
 
         step_size = max(getattr(self, 'step_threshold', 0.5), 1e-9)
         step_df['current_bin'] = np.round(step_df['current'] / step_size) * step_size
+        method = 'second_half'
+        try:
+            method = self.pol_avg_method_var.get()
+        except Exception:
+            pass  # Fallback to default if widget not initialized yet
 
-        averaged_steps = (step_df
-                          .groupby('current_bin', as_index=False)
-                          .agg({'current': 'mean', 'voltage': 'mean'})
-                          .sort_values('current'))
+        averaged_rows = []
+        for current_bin, group in step_df.groupby('current_bin', sort=False):
+            group = group.sort_index()
+            if method == 'second_half' and len(group) > 1:
+                start_idx = len(group) // 2
+                subset = group.iloc[start_idx:]
+            else:
+                subset = group
 
-        return averaged_steps
+            averaged_rows.append({
+                'current_bin': current_bin,
+                'current': subset['current'].mean(),
+                'voltage': subset['voltage'].mean()
+            })
+
+        averaged_steps = pd.DataFrame(averaged_rows)
+        if averaged_steps.empty:
+            return averaged_steps
+
+        averaged_steps = averaged_steps.sort_values('current_bin')
+        return averaged_steps[['current', 'voltage']]
 
     def _calculate_on_power_time(self):
         if self.combined_df is None or not self.timestamp_columns:
