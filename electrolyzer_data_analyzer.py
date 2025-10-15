@@ -1732,7 +1732,7 @@ class ElectrolyzerDataAnalyzer:
                     line, = self.pol_ax.plot(
                         current_density,
                         voltage_avg,
-                        label=f"{test['type']} {tag} ({test['start_time'].strftime('%H:%M:%S')})",
+                        label=f"{test['type']} {tag} ({test['start_time'].strftime('%Y-%m-%d %H:%M:%S')})",
                         color=color,
                         linewidth=2,
                         marker=marker,
