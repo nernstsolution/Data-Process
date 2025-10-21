@@ -676,6 +676,17 @@ class ElectrolyzerDataAnalyzer:
 
             df = df.sort_values('__time')
 
+            df['__time_diff'] = df['__time'].shift(-1) - df['__time']
+            df['__time_diff'] = df['__time_diff'].fillna(pd.Timedelta(0))
+            df['__time_diff'] = df['__time_diff'].mask(df['__time_diff'] < pd.Timedelta(0), pd.Timedelta(0))
+
+            time_diff_seconds = df['__time_diff'].dt.total_seconds().fillna(0.0)
+            df['__on_power_seconds'] = np.where(df['__current'] > 0, time_diff_seconds.clip(lower=0.0), 0.0)
+            df['__on_power_hours_end'] = df['__on_power_seconds'].cumsum() / 3600.0
+            df['__on_power_hours'] = df['__on_power_hours_end'].shift(fill_value=0.0)
+
+            total_on_power_hours = df['__on_power_seconds'].sum() / 3600.0
+
             tolerance = max(0.05, abs(target_current) * 0.02)
             current_mask = np.isclose(df['__current'], target_current, rtol=0.01, atol=tolerance) & (df['__current'] > 0)
 
@@ -686,9 +697,7 @@ class ElectrolyzerDataAnalyzer:
                 ))
                 return
 
-            filtered['on_power_seconds'] = filtered['__time'].diff().dt.total_seconds().fillna(0)
-            filtered['on_power_seconds'] = filtered['on_power_seconds'].clip(lower=0)
-            filtered['on_power_hours'] = filtered['on_power_seconds'].cumsum() / 3600.0
+            filtered['on_power_hours'] = df.loc[current_mask, '__on_power_hours']
 
             plot_series = []
             point_count = 0
@@ -726,7 +735,8 @@ class ElectrolyzerDataAnalyzer:
                 'target_current': target_current,
                 'tolerance': tolerance,
                 'row_count': len(filtered),
-                'point_count': point_count
+                'point_count': point_count,
+                'total_on_power_hours': total_on_power_hours
             }
 
             self.root.after(0, lambda res=result: self._render_durability_plot(res))
@@ -765,14 +775,22 @@ class ElectrolyzerDataAnalyzer:
         if len(series) > 1:
             self.durability_ax.legend()
 
+        max_data_time = max((item['time'][-1] if len(item['time']) else 0 for item in series), default=0.0)
+        total_on_power_hours = result.get('total_on_power_hours')
+        if total_on_power_hours is not None:
+            axis_max = max(total_on_power_hours, max_data_time, 0.0)
+            if axis_max > 0:
+                self.durability_ax.set_xlim(0, axis_max)
+        else:
+            total_on_power_hours = max_data_time
+
         self.durability_ax.grid(True, alpha=0.3)
         self.durability_fig.tight_layout()
         self.durability_canvas.draw()
 
-        max_time = max((item['time'][-1] if len(item['time']) else 0 for item in series), default=0)
         status_text = (
             f"Plotted {len(series)} voltage tag(s) across {result.get('row_count', 0)} matching rows "
-            f"(±{tolerance:.2f} A), reaching {max_time:.2f} on-power hours."
+            f"(±{tolerance:.2f} A), reaching {total_on_power_hours:.2f} on-power hours."
         )
         self.durability_status.config(text=status_text)
 
