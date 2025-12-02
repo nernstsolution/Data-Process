@@ -581,10 +581,19 @@ class ElectrolyzerDataAnalyzer:
         export_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
         export_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(export_frame, text="Export the current polarization plot data").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(export_frame, text="Export charts or data for sharing/printing").grid(row=0, column=0, sticky=tk.W, pady=(0, 4))
 
-        export_btn = ttk.Button(export_frame, text="Export Polarization Plot Data", command=self.export_polarization_plot_data)
-        export_btn.grid(row=1, column=0, sticky=tk.W, pady=(6, 0))
+        export_btn = ttk.Button(export_frame, text="Export Polarization Plot Data (CSV)", command=self.export_polarization_plot_data)
+        export_btn.grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+
+        chart_btn = ttk.Button(export_frame, text="Export Data Visualization Chart (PNG)", command=self.export_data_plot_png)
+        chart_btn.grid(row=2, column=0, sticky=tk.W, pady=(6, 0))
+
+        pol_chart_btn = ttk.Button(export_frame, text="Export Polarization Chart (PNG)", command=self.export_polarization_plot_png)
+        pol_chart_btn.grid(row=3, column=0, sticky=tk.W, pady=(6, 0))
+
+        dur_chart_btn = ttk.Button(export_frame, text="Export Durability Chart (PNG)", command=self.export_durability_plot_png)
+        dur_chart_btn.grid(row=4, column=0, sticky=tk.W, pady=(6, 0))
 
     def _find_current_columns(self):
         if self.combined_df is None:
@@ -1684,6 +1693,55 @@ class ElectrolyzerDataAnalyzer:
             messagebox.showinfo("Success", f"Polarization plot data exported to\n{file_path}")
         except Exception as exc:
             messagebox.showerror("Error", f"Failed to export data: {exc}")
+
+    def _export_chart_png(self, figure, canvas, default_filename, chart_label):
+        if figure is None:
+            messagebox.showwarning("Warning", f"No {chart_label} available to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            title=f"Export {chart_label}",
+            defaultextension=".png",
+            initialfile=default_filename,
+            filetypes=[("PNG Image", "*.png"), ("All Files", "*.*")]
+        )
+
+        if not file_path:
+            return
+
+        target_width, target_height = 900, 600  # pixels
+        target_dpi = 300  # high-resolution PNG suitable for printing
+
+        original_size = figure.get_size_inches()
+        original_dpi = figure.get_dpi()
+
+        try:
+            figure.set_size_inches(target_width / target_dpi, target_height / target_dpi)
+            figure.set_dpi(target_dpi)
+            figure.savefig(file_path, dpi=target_dpi, format='png')
+            messagebox.showinfo("Success", f"{chart_label} exported to\n{file_path}")
+        except Exception as exc:
+            messagebox.showerror("Error", f"Failed to export {chart_label}: {exc}")
+        finally:
+            try:
+                figure.set_size_inches(original_size)
+                figure.set_dpi(original_dpi)
+                if canvas is not None:
+                    canvas.draw_idle()
+            except Exception:
+                pass
+
+    def export_data_plot_png(self):
+        """Export the current data visualization chart as PNG"""
+        self._export_chart_png(self.fig, self.canvas, "data_visualization.png", "Data Visualization chart")
+
+    def export_polarization_plot_png(self):
+        """Export the current polarization chart as PNG"""
+        self._export_chart_png(self.pol_fig, self.pol_canvas, "polarization_chart.png", "Polarization chart")
+
+    def export_durability_plot_png(self):
+        """Export the current durability chart as PNG"""
+        self._export_chart_png(self.durability_fig, self.durability_canvas, "durability_chart.png", "Durability chart")
 
     def _plot_polarization_thread(self, selected_indices, voltage_tags, active_area):
         """Background thread for plotting polarization tests"""
